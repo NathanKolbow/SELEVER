@@ -1,0 +1,1324 @@
+---
+title: "Rey Lab Project Analyses"
+author: "Nathan Kolbow"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(MASS)
+library(gam)
+library(HLMdiag)
+library(merTools)
+library(party)
+library(LMERConvenienceFunctions)
+library(lme4)
+library(lmerTest)
+library(glmnet)
+library(spm2)
+library(HLMdiag)
+library(glmmLasso)
+library(ggparty)
+
+rel_df <- read.csv("../provided_materials/Warren_MF_SELEVER_16S_taxa_relative_abundance_3_16_23.csv")
+meta_raw <- read.csv("../provided_materials/Warren_MF_SELEVER_16S_metadata_3_16_23.csv", na.strings="")
+meta_df <- read.csv("../provided_materials/Warren_MF_SELEVER_16S_metadata_3_16_23.csv", na.strings="")
+meta_factors <- c(1, 2, 3, 4, 9, 12, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)
+for(col in meta_factors) {
+  meta_df[,col] <- as.factor(meta_df[,col])
+}
+meta_df$Number_of_animals_owned <- meta_df$Number_of_animals_other_than_poultry_owned + meta_df$Number_of_poultry_owned
+
+# One individual is mis-labeled
+meta_df$Number_of_animals_other_than_poultry_owned[which(meta_df$Number_of_other_animals_owned == 34)] <- 34
+meta_df$Number_of_other_animals_owned <- NULL
+```
+
+## Simple exploratory looks
+
+### Distributions of response variables of interest
+
+```{r}
+plot(density(meta_df$shannon_entropy))
+plot(density(meta_df$observed_features))
+plot(density(meta_df$faith_pd))
+```
+
+### Observed features seems to be uncorrelated with the number of non-zero relative abundances
+
+```{r}
+non_zeros <- c()
+for(row in 1:nrow(rel_df)) {
+  zeros <- c(non_zeros, sum(rel_df[row,] != 0))
+}
+plot(meta_df$observed_features, non_zeros)
+```
+
+### Check correlations
+
+Everything is correlated with one another to a decent degree.
+
+```{r}
+cor(meta_df[,c("shannon_entropy", "faith_pd", "observed_features")])
+```
+
+```{r}
+num_df <- meta_df
+num_df <- num_df[,unname(-which(apply(num_df, 2, function(x){return(sum(is.na(x)) > 0)})))]
+num_df$Sample_ID <- NULL
+num_df <- data.frame(apply(num_df, 2, as.numeric))
+cor.mat <- cor(num_df)
+
+shannon_idx <- 31
+faith_idx <- 32
+obs_idx <- 33
+
+shannon_cors <- cor.mat[-c(31, 32, 33),31]
+faith_cors <- cor.mat[-c(31, 32, 33),32]
+obs_cors <- cor.mat[-c(31, 32, 33),33]
+age_cors <- cor.mat[-c(4, 31, 32, 33),4]
+
+shannon_order <- order(shannon_cors, decreasing=T)
+faith_order <- order(faith_cors, decreasing=T)
+obs_order <- order(obs_cors, decreasing=T)
+age_order <- order(age_cors, decreasing=T)
+
+# Super weak correlations between everything except age
+shannon_cors[shannon_order[1:5]]
+faith_cors[faith_order[1:5]]
+obs_cors[obs_order[1:5]]
+age_cors[age_order[1:10]]
+```
+
+### Plot key relationships
+
+```{r}
+ggplot(meta_df, aes(x=1:nrow(meta_df), y=shannon_entropy)) +
+  geom_point() +
+  geom_smooth(se=F, method="loess") +
+  labs(x="Age (months)", y="Shannon Entropy") +
+  lims(y=c(0, max(meta_df$shannon_entropy)))
+
+ggplot(meta_df, aes(x=Child_age_months, y=shannon_entropy)) +
+  geom_point() +
+  geom_smooth(se=F, method="loess") +
+  labs(x="Age (months)", y="Shannon Entropy") +
+  lims(y=c(0, max(meta_df$shannon_entropy)))
+
+ggplot(meta_df, aes(x=Child_age_months, y=faith_pd)) +
+  geom_point() +
+  geom_smooth(se=F, method="loess") +
+  labs(x="Age (months)", y="Faith PD") +
+  lims(y=c(0, max(meta_df$faith_pd)))
+
+ggplot(meta_df, aes(x=Child_age_months, y=observed_features)) +
+  geom_point() +
+  geom_smooth(se=F, method="loess") +
+  labs(x="Age (months)", y="Observed Features") +
+  lims(y=c(0, max(meta_df$observed_features)))
+```
+
+## Missing data analyses
+
+### Cols with missing data
+
+We want to investigate whether the columns with missing data are useful at all, so that we can justify their removal later.
+
+```{r}
+na_cols <- colnames(meta_df)[c(6, 7, 8, 10, 11, 13, 14)]
+```
+
+## Modeling diversity
+
+### `lmer` with shannon and faith
+
+```{r, warning=F}
+norm_df <- meta_df %>%
+  mutate(across(where(is.numeric), function(x) {scale(x)[1:nrow(meta_df)]}))
+norm_df <- norm_df[,-unlist(which(colSums(is.na(meta_df)) > 0))]
+
+########################################################################################################
+################# lmer doesn't work without doing this for some reason (bug) ###########################
+########################################################################################################
+n <- colnames(norm_df)
+shannon_allvars <- as.formula(paste0(paste("shannon_entropy ~", paste(n[!n %in% "y"], collapse = " + ")), "-shannon_entropy"))
+update.formula(shannon_allvars,
+                 ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - faith_pd - observed_features - shannon_entropy
+                - Number_of_animals_owned # to fix rank deficiency
+                + (1 | Resident_Region_ID) 
+                + (1 | Resident_Commune_ID) 
+                + (1 | Village_ID))
+########################################################################################################
+########################################################################################################
+########################################################################################################
+
+shannon_mem <- lmer(update.formula(shannon_allvars,
+                 ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID
+                - faith_pd - observed_features - shannon_entropy
+                - Number_of_animals_owned # to fix rank deficiency
+                + (1 | Resident_Region_ID) 
+                + (1 | Resident_Commune_ID) 
+                + (1 | Village_ID)), 
+  data=norm_df
+)
+summary(shannon_mem)
+anova(shannon_mem)
+ranova(shannon_mem)
+
+shannon_stepped <- step(shannon_mem, trace=F, direction="both")
+# Model found: shannon_entropy ~ Child_age_months + (1 | Resident_Commune_ID)
+shannon_reduced <- lmer(shannon_entropy ~ Child_age_months + (1 | Resident_Commune_ID),
+                        data=norm_df)
+summary(shannon_reduced)
+anova(shannon_reduced)
+ranova(shannon_reduced)
+
+
+faith_mem <- lmer(
+  update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - shannon_entropy - faith_pd - observed_features
+                - Number_of_animals_owned # to fix rank deficiency
+                + (1 | Resident_Region_ID) 
+                + (1 | Resident_Commune_ID) 
+                + (1 | Village_ID)), data=norm_df)
+summary(faith_mem)
+anova(faith_mem)
+ranova(faith_mem)
+
+faith_stepped <- step(shannon_mem, trace=F, direction="both")
+# Same model found as for shannon_entropy
+faith_reduced1 <- lmer(faith_pd ~ Child_age_months + (1 | Resident_Commune_ID), data=norm_df)
+faith_reduced2 <- lm(faith_pd ~ Child_age_months, data=norm_df)
+anova(faith_reduced1, faith_reduced2)
+
+summary(faith_reduced1)
+anova(faith_reduced1)
+ranova(faith_reduced1)
+```
+
+### Try expanding model
+
+Failed to expand. Just regressing on age w/ random effect for commune is best...
+
+```{r}
+m1 <- lmer(shannon_entropy ~ Child_age_months + (1 | Resident_Commune_ID), data=norm_df)
+m2 <- lmer(shannon_entropy ~ Child_age_months + (Child_age_months | Resident_Commune_ID),
+           data=norm_df)
+
+anova(m2, m1)
+
+m3 <- lmer(shannon_entropy ~ Child_age_months
+           + I(Child_age_months^2)
+           + (1 | Resident_Commune_ID), data=norm_df)
+m4 <- lmer(shannon_entropy ~ Child_age_months
+           + I(Child_age_months^2)
+           + I(Child_age_months^3)
+           + (1 | Resident_Commune_ID), data=norm_df)
+anova(m4, m3)
+anova(m3, m1)
+
+# log-link w/ glmer gives slightly better AIC than link="identity", so we use it
+m5 <- glmer(meta_df$shannon_entropy ~ poly(Child_age_months, 2)
+            + (1 | Resident_Commune_ID), family=gaussian(link="log"), data=norm_df)
+m6 <- glmer(shannon_entropy ~ poly(Child_age_months, 2)
+            + (1 | Resident_Commune_ID), family=gaussian(link="identity"), data=norm_df)
+AIC(m5) < AIC(m6)
+
+AIC(m5) < AIC(m3)
+```
+
+### Plot predictions over data for some individuals
+
+```{r}
+gg_df <- meta_df %>%
+  mutate(prediction=predict(m5, type="response")) %>%
+  filter(Resident_Commune_ID %in% c(8, 9, 10, 11, 12, 13, 14, 15, 16))
+
+ggplot(gg_df, aes(x=Child_age_months, y=shannon_entropy)) +
+  geom_point() + geom_line(aes(y=prediction), color="red") +
+  geom_point(aes(y=prediction), color="red") +
+  facet_wrap(~Resident_Commune_ID)
+```
+
+```{r}
+unique_communes <- unique(norm_df$Resident_Commune_ID)
+unique_ages <- unique(norm_df$Child_age_months)
+
+fixed_m5 <- glm(meta_df$shannon ~ poly(Child_age_months, 2), data=norm_df, family=gaussian(link="log"))
+gg_df <- meta_df %>%
+  group_by(Child_age_months) %>%
+  summarise(mean=mean(shannon_entropy)) %>%
+  mutate(pred=predict(fixed_m5, type="response", newdata=data.frame(Child_age_months=unique_ages)))
+
+ggplot(gg_df, aes(x=Child_age_months, y=mean)) +
+  geom_point() +
+  geom_point(aes(y=pred), color="red")
+```
+
+### DFFITS
+
+From the few communes I've looked at, they seem to follow very similar trends, and all individuals in the commune seem to be well-explained by the commune's trend. However, it may be fruitful to look at the outlying points within each commune.
+
+One outlying point seen above is `Sample_ID` `BF0434`.
+
+```{r}
+if(F) {
+  # Don't have a package for DFFITS for glmer right now, so we calculate ourselves
+  beta1_diffs <- c()
+  beta2_diffs <- c()
+  baselines <- unlist(unname(coef(m5)$Resident_Commune_ID[1,c(2, 3)]))
+  for(i in 1:nrow(norm_df)) {
+    m <- glmer(meta_df$shannon_entropy[-i] ~ poly(Child_age_months, 2)
+              + (1 | Resident_Commune_ID), family=gaussian(link="log"), data=norm_df[-i,])
+    
+    beta1_diffs <- c(beta1_diffs,
+                     baselines[1] - coef(m)$Resident_Commune_ID[1,2])
+    beta2_diffs <- c(beta2_diffs,
+                     baselines[2] - coef(m)$Resident_Commune_ID[1,3])
+  }
+  
+  # is_outlier <- ifelse(fit_diffs > mean(fit_diffs) + 3 * sd(fit_diffs) | fit_diffs < mean(fit_diffs) - 3 * sd(fit_diffs), T, F)
+  gg_df <- data.frame(
+    ID=rep(meta_df$Sample_ID, 2),
+    diff=c(beta1_diffs, beta2_diffs),
+    beta=factor(rep(c("Age", "Age^2"), each=nrow(meta_df))),
+    is_outlier=c(
+      beta1_diffs > mean(beta1_diffs) + 3*sd(beta1_diffs) | beta1_diffs < mean(beta1_diffs) - 3*sd(beta1_diffs),
+      beta2_diffs > mean(beta2_diffs) + 3*sd(beta2_diffs) | beta2_diffs < mean(beta2_diffs) - 3*sd(beta2_diffs)
+    )
+  )
+  
+  ggplot(gg_df, aes(x=ID, y=diff, color=is_outlier)) +
+    geom_point() + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) +
+    facet_wrap(~beta) +
+    geom_hline(yintercept=0, color="black") +
+    scale_color_manual(values=c("black", "red"))
+  
+    #+
+    #geom_hline(yintercept=mean(fit_diffs) + 3 * sd(fit_diffs), color="red", linetype="dashed") +
+    #geom_hline(yintercept=mean(fit_diffs) - 3 * sd(fit_diffs), color="red", linetype="dashed") +
+    #geom_text(label=ifelse(is_outlier, meta_df$Sample_ID, ""), nudge_x=20)
+}
+```
+
+### Looking at individuals that don't follow the trend
+
+Gathering individuals who are outside of their 99\% prediction interval.
+
+```{r}
+pred <- predictInterval(m5, newdata=norm_df, type="probability")
+```
+
+### t-test
+
+Do a $t$-test over all of our variables of interest (all animal variables & diversity vars) to see if these outliers differ significantly from everyone else.
+
+Another idea: calculate how many standard deviations away from the mean each sample is for the above fits, and check the correlations between those values and all other variables in the dataset.
+
+```{r}
+outliers <- unique((rep(1:nrow(meta_df), 2))[gg_df$is_outlier])
+
+t.test(meta_df$shannon_entropy[outliers], meta_df$shannon_entropy[-outliers], paired=F, var.equal=F)
+t.test(meta_df$faith_pd[outliers], meta_df$faith_pd[-outliers], paired=F, var.equal=F)
+
+vars <- colnames(meta_df)[5:44]
+vars <- vars[c(-5)]
+
+for(col in vars) {
+  test_outcome <- t.test(as.numeric(meta_df[outliers, col]), as.numeric(meta_df[-outliers, col]), paired=F, var.equal=F)
+  
+  if(test_outcome$p.value < 0.05) {
+    print(col)
+  }
+}
+
+```
+
+
+## Outlier detection
+
+### DFFITS by hand
+
+```{r}
+norm_df <- meta_df %>%
+  mutate(across(where(is.numeric) & !c(shannon_entropy, faith_pd, observed_features), function(x) {scale(x)[1:nrow(meta_df)]}))
+norm_df <- norm_df[,-unlist(which(colSums(is.na(norm_df)) > 0))]
+sfit <- lmer(shannon_entropy ~ Child_age_months + Feces_visible_in_outdoor_food_preparation_area 
+             + Number_of_cattle_owned + Number_of_goats_owned + Number_of_sheep_owned 
+             + Number_of_donkeys_owned + Number_of_pigs_owned 
+             + (1 | Resident_Commune_ID),
+             data=norm_df)
+
+baseline_beta <- fixef(sfit)[[2]]
+n <- nrow(norm_df)
+dfbeta <- numeric(n)
+
+for(i in 1:n) {
+  if(i %% 50 == 0) { print(i) }
+  new.fit <- lmer(shannon_entropy ~ Child_age_months + Feces_visible_in_outdoor_food_preparation_area 
+             + Number_of_cattle_owned + Number_of_goats_owned + Number_of_sheep_owned 
+             + Number_of_donkeys_owned + Number_of_pigs_owned 
+             + (1 | Resident_Commune_ID),
+             data=norm_df[-i,])
+  dfbeta[i] <- fixef(new.fit)[[2]] - baseline_beta
+}
+```
+
+### Visual outlier detection
+
+```{r}
+gg_df <- meta_df
+gg_df$idx <- 1:nrow(gg_df)
+
+ggplot(gg_df, aes(x=idx, y=Number_of_cattle_owned)) +
+  geom_point(color=ifelse(gg_df$Number_of_cattle_owned > 40, "red", "black")) +
+  geom_text(aes(label=ifelse(Number_of_cattle_owned > 40, idx, "")), nudge_x=30) +
+  labs(x="Index", y="Number of Cattle Owned")
+ggplot(gg_df, aes(x=idx, y=Number_of_donkeys_owned)) +
+  geom_point(color=ifelse(gg_df$Number_of_donkeys_owned > 10, "red", "black")) +
+  geom_text(aes(label=ifelse(Number_of_donkeys_owned > 10, idx, "")), nudge_x=30) +
+  labs(x="Index", y="Number of Donkeys Owned")
+ggplot(gg_df, aes(x=idx, y=shannon_entropy)) +
+  geom_point(color=ifelse(gg_df$shannon_entropy < 3, "red", "black")) +
+  geom_text(aes(label=ifelse(shannon_entropy < 3, idx, "")), nudge_x=30) +
+  labs(x="Index", y="Shannon Entropy")
+```
+
+### idx 4, 101, 133, 152, 261, 280, 285, 330, 332, 649, 626, are highly influential
+
+Results were very nice when only 4, 330, 332 were removed
+
+```{r}
+# Influence diagnostics are fine
+influence <- hlm_influence(shannon_reduced) %>%
+  mutate(gg_cooks_label=ifelse(cooksd > 0.02, as.character(id), "")) %>%
+  mutate(gg_cooks_color=ifelse(gg_cooks_label == "", "black", "red")) %>%
+  mutate(gg_lev_label=ifelse(leverage.overall > 0.0465, as.character(id), "")) %>%
+  mutate(gg_lev_color=ifelse(gg_lev_label == "", "black", "red")) %>%
+  mutate(dfbeta=dfbeta, gg_dfbeta_label=ifelse(abs(dfbeta) > 0.004, as.character(id), "")) %>%
+  mutate(gg_dfbeta_color=ifelse(gg_dfbeta_label == "", "black", "red"))
+
+ggplot(meta_df, aes(x=1:nrow(meta_df), y=shannon_entropy)) +
+  geom_point()
+
+ggplot(influence, aes(x=id, y=cooksd)) +
+  geom_point(color=influence$gg_cooks_color) +
+  labs(x="Index", y="MDFFITS / Cooks Distance") +
+  geom_text(aes(label=gg_cooks_label), nudge_x=27) +
+  guides(color=F) +
+  geom_hline(yintercept=0.019, color="red", linetype="dashed")
+ggplot(influence, aes(x=id, y=leverage.overall)) +
+  geom_point(color=influence$gg_lev_color) +
+  geom_text(aes(label=gg_lev_label), nudge_x=27) +
+  labs(x="Index", y="Leverage") +
+  geom_hline(yintercept=0.0465, color="red", linetype="dashed")
+ggplot(influence, aes(x=id, y=dfbeta)) +
+  geom_point(color=influence$gg_dfbeta_color) +
+  geom_text(aes(label=gg_dfbeta_label), nudge_x=27) +
+  guides(color=F) +
+  geom_hline(yintercept=c(0.005, -0.005), color="red", linetype="dashed") +
+  labs(x="Index", y="DFBETA")
+```
+
+Scale `norm_df` w/o these outliers
+
+```{r}
+norm_df <- meta_df[-c(4, 101, 133, 152, 261, 280, 285, 330, 332, 649, 626),]
+norm_df <- norm_df %>%
+  mutate(across(where(is.numeric), function(x) {scale(x)[1:nrow(norm_df)]}))
+norm_df <- norm_df[,-unlist(which(colSums(is.na(norm_df)) > 0))]
+
+# We use logs later
+log_df <- meta_df[-c(4, 101, 133, 152, 261, 280, 285, 330, 332, 649, 626),] %>%
+  mutate(shannon_entropy=shannon_entropy^2,
+         faith_pd=sqrt(faith_pd),
+         observed_features=observed_features^(2/3)) %>%
+  mutate(across(where(is.numeric) & !c(shannon_entropy, faith_pd, observed_features), function(x) { scale(x)[1:nrow(log_df)]}))
+cols_with_na <- names(which(colSums(is.na(log_df)) > 0))
+for(col in cols_with_na) {
+  nas <- is.na(log_df[,col])
+  if(is.factor(log_df[,col])) {
+    unq <- unique(log_df[!nas,col])
+    log_df[nas,col] <- unq[which.max(tabulate(match(log_df[!nas,col], unq)))]
+  } else {
+    log_df[nas,col] <- mean(log_df[!nas,col])
+  }
+}
+
+log_full <- meta_df
+log_full <- log_full %>%
+  mutate(shannon_entropy=shannon_entropy^2,
+         faith_pd=sqrt(faith_pd),
+         observed_features=observed_features^(2/3)) %>%
+  mutate(across(where(is.numeric) & !c(shannon_entropy, faith_pd, observed_features), function(x) { scale(x)[1:nrow(log_full)]}))
+cols_with_na <- names(which(colSums(is.na(log_full)) > 0))
+for(col in cols_with_na) {
+  nas <- is.na(log_full[,col])
+  if(is.factor(log_full[,col])) {
+    unq <- unique(log_full[!nas,col])
+    log_full[nas,col] <- unq[which.max(tabulate(match(log_full[!nas,col], unq)))]
+  } else {
+    log_full[nas,col] <- mean(log_full[!nas,col])
+  }
+}
+```
+
+Re-fit shannon
+
+```{r}
+# Redo step fxn without these outliers
+shannon_mem_noout <- lmer(update.formula(shannon_allvars,
+                shannon_entropy ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - faith_pd - observed_features - shannon_entropy
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned # to fix rank deficiency
+                + (1 | Resident_Region_ID) 
+                + (1 | Resident_Commune_ID) 
+                + (1 | Village_ID)),
+                data=log_df)
+
+shannon_stepped <- step(shannon_mem_noout, trace=F, direction="both")
+
+shannonA <- lmer(shannon_entropy ~ Child_age_months 
+                 + Feces_visible_in_outdoor_food_preparation_area 
+                 + (1 | Resident_Commune_ID),
+                 data=log_df)
+drop1(shannonA, test="F")
+
+shannonB <- lmer(shannon_entropy ~ Child_age_months + I(Child_age_months^2)
+                 + Feces_visible_in_outdoor_food_preparation_area 
+                 + (1 | Resident_Commune_ID),
+                 data=log_df)
+anova(shannonA, shannonB)
+
+shannonC <- lmer(shannon_entropy ~ Child_age_months + I(Child_age_months^2) + I(Child_age_months > 0)
+                 + Feces_visible_in_outdoor_food_preparation_area 
+                 + (1 | Resident_Commune_ID),
+                 data=log_df)
+anova(shannonB, shannonC)
+
+shannonD <- lmer(shannon_entropy ~ Child_age_months + I(Child_age_months^2)
+                 + Feces_visible_in_outdoor_food_preparation_area 
+                 + (Child_age_months | Resident_Commune_ID),
+                 data=log_df)
+anova(shannonB, shannonD)
+
+shannonE <- lmer(shannon_entropy ~ Child_age_months + I(Child_age_months^2)
+                 + (1 | Resident_Commune_ID),
+                 data=log_df)
+anova(shannonE, shannonB)
+
+# shannonE
+drop1(shannonE, test="F")
+ranova(shannonE)
+```
+
+Now faith
+
+Coefficients are SO similar to the coefficients in the shannon model!
+
+```{r}
+# Redo step fxn without these outliers
+faith_mem_noout <- lmer(update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - faith_pd - observed_features - shannon_entropy
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned # to fix rank deficiency
+                + I(Child_age_months^2)
+                + (1 | Resident_Region_ID) 
+                + (1 | Village_ID)),
+                control=lmerControl(optimizer="Nelder_Mead"),
+                data=log_df)
+
+faith_stepped <- step(faith_mem_noout, trace=F, direction="both")
+
+faithA <- lm(faith_pd ~ Child_age_months
+             + Number_of_cattle_owned, 
+             data=log_df)
+drop1(faithA, test="F")
+
+faithB <- lmer(faith_pd ~ Child_age_months
+               + Number_of_cattle_owned
+               + (1 | Resident_Commune_ID), # no ranef significant
+               data=log_df)
+anova(faithB, faithA)
+
+faithC <- lm(faith_pd ~ Child_age_months,
+             data=log_df)
+anova(faithC, faithA)
+
+faithD <- lm(faith_pd ~ Child_age_months + I(Child_age_months^2), 
+             data=log_df)
+anova(faithC, faithD)
+
+faithE <- lmer(faith_pd ~ Child_age_months + I(Child_age_months^2)
+               + (1 | Resident_Region_ID), # no ranef signif 
+             data=log_df)
+anova(faithE, faithD)
+
+# faithC
+```
+
+Now observed features
+
+```{r}
+# Redo step fxn without these outliers
+obs_mem_noout <- lmer(update.formula(shannon_allvars,
+                observed_features ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - faith_pd - observed_features - shannon_entropy
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned # to fix rank deficiency\
+                + I(Child_age_months^2)
+                + (1 | Resident_Region_ID) 
+                + (1 | Resident_Commune_ID) 
+                + (1 | Village_ID)), 
+                data=log_df)
+
+obs_stepped <- step(obs_mem_noout, trace=F, direction="both")
+
+obsA <- lmer(observed_features ~ Child_age_months
+             + (1 | Village_ID),
+             data=log_df)
+
+obsB <- lmer(observed_features ~ Child_age_months + I(Child_age_months^2)
+             + (1 | Village_ID),
+             data=log_df)
+anova(obsA, obsB)
+
+obsC <- lmer(observed_features ~ Child_age_months + I(Child_age_months^2)
+             + (Child_age_months | Village_ID),
+             data=log_df)
+anova(obsB, obsC)
+
+obsD <- lmer(observed_features ~ Child_age_months + I(Child_age_months^2)
+             + Number_of_cattle_owned
+             + (1 | Village_ID),
+             data=log_df)
+anova(obsB, obsD)
+
+# obsB
+drop1(obsB, test="F")
+ranova(obsB)
+```
+
+## Influence of outliers
+
+```{r}
+outlier_idxs <- c(4, 101, 133, 152, 261, 280, 285, 330, 332, 649, 626)
+gg_df <- meta_df
+gg_df$outlier <- F
+gg_df$outlier[outlier_idxs] <- T
+
+ggplot(gg_df, aes(x=1, y=Number_of_cattle_owned)) +
+  geom_boxplot(outlier.alpha=0) +
+  geom_jitter(width=0.25, alpha=0.25, color=ifelse(gg_df$outlier, "red", "black"))
+```
+
+## Lasso regression
+
+### Lasso & shannon
+
+With resident commune IDs and village IDs included, some communes and some villages sneak in with non-zero coefficients. With or without them, though, the coefficient for age is one or two orders of magnitude greater than the coefficients for every other fixed effect predictor.
+
+```{r}
+shannon_x <- model.matrix(update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID 
+                - shannon_entropy - faith_pd - observed_features
+                - Number_of_animals_owned), data=log_df)[,-1]
+shannon_y <- log_df$shannon_entropy
+shannon_lassocv <- cv.glmnet(shannon_x, shannon_y, alpha=1)
+shannon_lasso <- glmnet(shannon_x, shannon_y, alpha=1, lambda=shannon_lassocv$lambda.min)
+rownames(coef(shannon_lasso))[which(coef(shannon_lasso) != 0)]
+```
+
+```{r}
+nonzero_coefs <- coef(shannon_lasso)[which(coef(shannon_lasso) != 0)]
+names(nonzero_coefs) <- rownames(coef(shannon_lasso))[which(coef(shannon_lasso) != 0)]
+nonzero_coefs
+```
+
+### `glmmLasso`
+
+```{r}
+# https://github.com/yonicd/lmmen/blob/master/R/cv.glmmlasso.R
+cv.glmmLasso=function(dat,
+                      form.fixed=NULL,
+                      form.rnd=NULL,
+                      lambda=seq(500,0,by=-50),
+                      family=stats::gaussian(link = "identity")
+                      ){
+  
+  if(inherits(dat,'matrix')) dat <- as.data.frame(dat)
+    
+  d.size=(max(as.numeric(row.names(dat)))*(sum(grepl('^Z',names(dat)))+1))+(sum(grepl('^X',names(dat)))+1)
+  
+  dat<-data.frame(subject=as.factor(row.names(dat)),dat,check.names = FALSE,row.names = NULL)
+  
+  if(is.null(form.fixed)) form.fixed<-sprintf('y~%s',paste(grep('^X',names(dat),value = TRUE),collapse = '+'))
+  if(is.null(form.rnd)) form.rnd<-eval(parse(text=sprintf('form.rnd<-list(subject=~1+%s)',paste(grep('^Z',names(dat),value = TRUE),collapse = '+'))))
+  
+  BIC_vec<-rep(Inf,length(lambda))
+  
+  # specify starting values for the very first fit; pay attention that Delta.start has suitable length! 
+  
+  #Delta.start.base<-Delta.start<-as.matrix(t(rep(0,d.size)))
+  #Q.start.base<-Q.start<-0.1  
+  
+  for(j in 1:length(lambda))
+  {
+    suppressMessages({
+      suppressWarnings({
+        fn <- try(glmmLasso::glmmLasso(fix = stats::as.formula(form.fixed),
+                                       rnd = form.rnd,
+                                       data = dat,lambda = lambda[j],
+                                       switch.NR = FALSE,final.re=TRUE)
+        )
+      })      
+    })
+    
+    if(class(fn)!="try-error")
+    {  
+      BIC_vec[j]<-fn$bic
+      #Delta.start<-rbind(Delta.start,fn$Deltamatrix[fn$conv.step,])
+      #Q.start<-c(Q.start,fn$Q_long[[fn$conv.step+1]])
+    }else{
+      #Delta.start<-rbind(Delta.start,Delta.start.base)
+      #Q.start<-c(Q.start,Q.start.base)
+    }
+  }
+  
+    opt<-which.min(BIC_vec)
+  
+    suppressWarnings({
+    final <- glmmLasso::glmmLasso(fix = as.formula(form.fixed), rnd = form.rnd,
+                                  data = dat, lambda=lambda[opt],switch.NR=FALSE,final.re=TRUE)
+    
+    final
+  })
+  
+  list(fit.opt=final,BIC_path=BIC_vec,lambda.opt=lambda[opt])
+}  
+```
+
+```{r, warning=F}
+# Find ideal lambda
+set.seed(42)
+lambdas <- sort(runif(50, min=0, max=25))
+gl.cv <- cv.glmmLasso(log_df,
+                      form.fixed=update.formula(shannon_allvars,
+                                                shannon_entropy ~ . 
+                                                - Sample_ID 
+                                                - shannon_entropy - faith_pd - observed_features
+                                                - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                                                - Number_of_animals_owned
+                                                + I(Child_age_months^2)),
+                      form.rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                      family=gaussian(link="identity"),
+                      lambda=lambdas)
+gl.cv$lambda.opt  # 7.38
+
+gl.cv <- cv.glmmLasso(log_df,
+                      form.fixed=update.formula(shannon_allvars,
+                                                shannon_entropy ~ . 
+                                                - Sample_ID 
+                                                - shannon_entropy - faith_pd - observed_features
+                                                - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                                                - Number_of_animals_owned
+                                                + I(Child_age_months^2)),
+                      form.rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                      family=gaussian(link="identity"),
+                      lambda=seq(10, 0, by=-0.1))
+gl.cv$lambda.opt # 7.7
+
+gl.fit <- gl.cv$fit.opt
+
+gl.fit <- glmmLasso(fix=update.formula(shannon_allvars,
+                                                shannon_entropy ~ . 
+                                                - Sample_ID 
+                                                - shannon_entropy - faith_pd - observed_features
+                                                - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                                                - Number_of_animals_owned
+                                                + I(Child_age_months^2)),
+                    rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                    family=gaussian(link="identity"),
+                    lambda=7.7, data=log_df)
+(nonzero_fixed <- coef(gl.fit)[which(coef(gl.fit) != 0)])  # age & age^2
+```
+
+Now with faith
+
+```{r, warning=F}
+# Find ideal lambda
+set.seed(41)
+lambdas <- sort(runif(100, min=0, max=100))
+gl.cv <- cv.glmmLasso(log_df,
+                      form.fixed=update.formula(shannon_allvars,
+                                                faith_pd ~ . 
+                                                - Sample_ID 
+                                                - shannon_entropy - faith_pd - observed_features
+                                                - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                                                - Number_of_animals_owned
+                                                + I(Child_age_months^2) + I(Child_age_months > -0.274)),
+                      form.rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                      family=gaussian(link="identity"),
+                      lambda=lambdas)
+gl.cv$lambda.opt  # 42.6
+plot(lambdas, gl.cv$BIC_path)
+
+gl.fit <- glmmLasso(fix=update.formula(shannon_allvars,
+                    faith_pd ~ . 
+                    - Sample_ID 
+                    - shannon_entropy - faith_pd - observed_features
+                    - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                    - Number_of_animals_owned
+                    + I(Child_age_months^2)
+                    + I(Child_age_months > -0.274)),
+                    rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                    family=gaussian(link="identity"),
+                    lambda=42.6, data=log_df)
+(nonzero_fixed <- coef(gl.fit)[which(coef(gl.fit) != 0)])
+# only intercept
+```
+
+Now with observed features
+
+```{r, warning=F}
+# Find ideal lambda
+set.seed(43)
+lambdas <- sort(runif(100, min=0, max=100))
+gl.cv <- cv.glmmLasso(log_df,
+                      form.fixed=update.formula(shannon_allvars,
+                                                observed_features ~ . 
+                                                - Sample_ID 
+                                                - shannon_entropy - faith_pd - observed_features
+                                                - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                                                - Number_of_animals_owned
+                                                + I(Child_age_months^2) + I(Child_age_months > -0.274)),
+                      form.rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                      family=gaussian(link="identity"),
+                      lambda=lambdas)
+gl.cv$lambda.opt  # 22-59
+plot(lambdas, gl.cv$BIC_path)
+
+
+gl.fit <- gl.cv$fit.opt
+
+gl.fit <- glmmLasso(fix=update.formula(shannon_allvars,
+                    observed_features ~ . 
+                    - Sample_ID 
+                    - shannon_entropy - faith_pd - observed_features
+                    - Resident_Commune_ID - Village_ID - Resident_Region_ID
+                    - Number_of_animals_owned
+                    + I(Child_age_months^2)),
+                    rnd=list(Resident_Commune_ID=~1, Village_ID=~1, Resident_Region_ID=~1),
+                    family=gaussian(link="identity"),
+                    lambda=22, data=log_df)
+(nonzero_fixed <- coef(gl.fit)[which(coef(gl.fit) != 0)])
+```
+
+## Binning age
+
+### Does `lmer` find any different trends if we only look at certain 12 month age windows?
+
+With shannon entropy
+
+Nothing meaningful for any window size/step
+
+```{r, warning=F}
+window_size <- 3  # size & step are in months
+window_step <- 2
+nsteps <- ceiling((max(meta_df$Child_age_months) - min(meta_df$Child_age_months)) / window_step) - 1
+window <- c(min(meta_df$Child_age_months), min(meta_df$Child_age_months) + window_size)
+
+lmer_coefs <- c()
+lasso_coefs <- c()
+
+for(iter in 1:nsteps) {
+  filtered_df <- log_df %>%
+    filter(meta_df$Child_age_months[-outlier_idxs] >= window[1] & meta_df$Child_age_months[-outlier_idxs] <= window[2])
+  
+  x <- model.matrix(update.formula(shannon_allvars,
+                shannon_entropy ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=filtered_df)[,-1]
+  y <- filtered_df$shannon_entropy
+  cv.fit <- cv.glmnet(x, y, alpha=1)
+  lasso.fit <- glmnet(x, y, alpha=1, lambda=cv.fit$lambda.min)
+  nonzero_coefs <- rownames(coef(lasso.fit))[which(coef(lasso.fit) != 0)]
+  lasso_coefs <- c(lasso_coefs, nonzero_coefs)
+  
+  # cat(paste0("[", window[1], ", ", window[2], "], n=", nrow(filtered_df), ":\n\tLasso - ", paste0(nonzero_coefs, collapse=", "), "\n", sep=""))
+  
+  lmer.formula <- update.formula(shannon_allvars,
+                shannon_entropy ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID) + (1 | Village_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned)
+  remove.preds <- colnames(filtered_df[apply(filtered_df, 2, function(x) { length(unique(x)) == 1 })])
+  
+  if(length(remove.preds) > 0)
+    lmer.formula <- update.formula(lmer.formula, as.formula(paste0(". ~ . - ", paste0(remove.preds, collapse=" - ", sep=""), sep="")))
+  
+  lmer.fit <- lmer(lmer.formula, data=filtered_df,
+                control=lmerControl(check.conv.singular=.makeCC(action="ignore", tol=formals(isSingular)$tol)))
+  step.lmer <- attr(step(lmer.fit, direction="both", trace=F), "model")
+  
+  if(class(step.lmer) == "lm") {
+    incl_coefs <- names(coef(step.lmer))
+  } else {
+    incl_coefs <- c(names(fixef(step.lmer)), names(ranef(step.lmer)))
+  }
+  
+  lmer_coefs <- c(lmer_coefs, incl_coefs)
+  
+  # cat(paste0("\tLMER - ", paste0(incl_coefs[-1], collapse=", "), "\n"))
+  
+  tre <- ctree(update.formula(shannon_allvars,
+                shannon_entropy ~ . - Sample_ID
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features), data=filtered_df)
+  plot(tre)
+  
+  window <- window + window_step
+}
+
+lmer_tab <- tabulate(factor(lmer_coefs))
+int_idx <- which(levels(factor(lmer_coefs)) == "(Intercept)")
+lmer_tab <- paste0(round(100 * lmer_tab[-int_idx] / lmer_tab[int_idx], 2), "%")
+names(lmer_tab) <- levels(factor(lmer_coefs))[-int_idx]
+lmer_tab[order(tabulate(factor(lmer_coefs))[-int_idx], decreasing=T)]
+
+lasso_tab <- tabulate(factor(lasso_coefs))
+lasso_tab <- paste0(round(100 * lasso_tab[2:length(lasso_tab)] / lasso_tab[1], 2), "%")
+names(lasso_tab) <- levels(factor(lasso_coefs))[2:(length(lasso_tab)+1)]
+lasso_tab[order(tabulate(factor(lasso_coefs))[2:(length(lasso_tab)+1)], decreasing=T)]
+```
+
+Now with faith
+
+```{r, warning=F}
+window_size <- 6  # size & step are in months
+window_step <- 2
+nsteps <- ceiling((max(meta_df$Child_age_months) - min(meta_df$Child_age_months)) / window_step) - 1
+window <- c(min(meta_df$Child_age_months), min(meta_df$Child_age_months) + window_size)
+
+lmer_coefs <- c()
+lasso_coefs <- c()
+
+for(iter in 1:nsteps) {
+  filtered_df <- log_df %>%
+    filter(meta_df$Child_age_months[-outlier_idxs] >= window[1] & meta_df$Child_age_months[-outlier_idxs] <= window[2])
+  
+  x <- model.matrix(update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=filtered_df)[,-1]
+  y <- filtered_df$faith_pd
+  cv.fit <- cv.glmnet(x, y, alpha=1)
+  lasso.fit <- glmnet(x, y, alpha=1, lambda=cv.fit$lambda.min)
+  nonzero_coefs <- rownames(coef(lasso.fit))[which(coef(lasso.fit) != 0)]
+  lasso_coefs <- c(lasso_coefs, nonzero_coefs)
+  
+  # cat(paste0("[", window[1], ", ", window[2], "], n=", nrow(filtered_df), ":\n\tLasso - ", paste0(nonzero_coefs, collapse=", "), "\n", sep=""))
+  
+  lmer.formula <- update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID) + (1 | Village_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned)
+  remove.preds <- colnames(filtered_df[apply(filtered_df, 2, function(x) { length(unique(x)) == 1 })])
+  
+  if(length(remove.preds) > 0)
+    lmer.formula <- update.formula(lmer.formula, as.formula(paste0(". ~ . - ", paste0(remove.preds, collapse=" - ", sep=""), sep="")))
+  
+  lmer.fit <- lmer(lmer.formula, data=filtered_df,
+                control=lmerControl(check.conv.singular=.makeCC(action="ignore", tol=formals(isSingular)$tol)))
+  step.lmer <- attr(step(lmer.fit, direction="both", trace=F), "model")
+  
+  if(class(step.lmer) == "lm") {
+    incl_coefs <- names(coef(step.lmer))
+  } else {
+    incl_coefs <- c(names(fixef(step.lmer)), names(ranef(step.lmer)))
+  }
+  
+  lmer_coefs <- c(lmer_coefs, incl_coefs)
+  
+  # cat(paste0("\tLMER - ", paste0(incl_coefs[-1], collapse=", "), "\n"))
+  
+  tre <- ctree(update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features), data=filtered_df)
+  plot(tre)
+  
+  
+  window <- window + window_step
+}
+
+lmer_tab <- tabulate(factor(lmer_coefs))
+lmer_tab <- paste0(round(100 * lmer_tab[2:length(lmer_tab)] / lmer_tab[1], 2), "%")
+names(lmer_tab) <- levels(factor(lmer_coefs))[2:(length(lmer_tab)+1)]
+lmer_tab[order(tabulate(factor(lmer_coefs))[2:(length(lmer_tab)+1)], decreasing=T)]
+
+lasso_tab <- tabulate(factor(lasso_coefs))
+lasso_tab <- paste0(round(100 * lasso_tab[2:length(lasso_tab)] / lasso_tab[1], 2), "%")
+names(lasso_tab) <- levels(factor(lasso_coefs))[2:(length(lasso_tab)+1)]
+lasso_tab[order(tabulate(factor(lasso_coefs))[2:(length(lasso_tab)+1)], decreasing=T)]
+```
+
+Now with obs feats
+
+```{r, warning=F}
+window_size <- 12  # size & step are in months
+window_step <- 2
+nsteps <- ceiling((max(meta_df$Child_age_months) - min(meta_df$Child_age_months)) / window_step) - 1
+window <- c(min(meta_df$Child_age_months), min(meta_df$Child_age_months) + window_size)
+
+lmer_coefs <- c()
+lasso_coefs <- c()
+
+for(iter in 1:nsteps) {
+  filtered_df <- log_df %>%
+    filter(meta_df$Child_age_months[-outlier_idxs] >= window[1] & meta_df$Child_age_months[-outlier_idxs] <= window[2])
+  
+  x <- model.matrix(update.formula(shannon_allvars,
+                observed_features ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=filtered_df)[,-1]
+  y <- filtered_df$observed_features
+  cv.fit <- cv.glmnet(x, y, alpha=1)
+  lasso.fit <- glmnet(x, y, alpha=1, lambda=cv.fit$lambda.min)
+  nonzero_coefs <- rownames(coef(lasso.fit))[which(coef(lasso.fit) != 0)]
+  lasso_coefs <- c(lasso_coefs, nonzero_coefs)
+  
+  # cat(paste0("[", window[1], ", ", window[2], "], n=", nrow(filtered_df), ":\n\tLasso - ", paste0(nonzero_coefs, collapse=", "), "\n", sep=""))
+  
+  lmer.formula <- update.formula(shannon_allvars,
+                observed_features ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID 
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID) + (1 | Village_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned)
+  remove.preds <- colnames(filtered_df[apply(filtered_df, 2, function(x) { length(unique(x)) == 1 })])
+  
+  if(length(remove.preds) > 0)
+    lmer.formula <- update.formula(lmer.formula, as.formula(paste0(". ~ . - ", paste0(remove.preds, collapse=" - ", sep=""), sep="")))
+  
+  lmer.fit <- lmer(lmer.formula, data=filtered_df,
+                control=lmerControl(check.conv.singular=.makeCC(action="ignore", tol=formals(isSingular)$tol)))
+  step.lmer <- attr(step(lmer.fit, direction="both", trace=F), "model")
+  
+  if(class(step.lmer) == "lm") {
+    incl_coefs <- names(coef(step.lmer))
+  } else {
+    incl_coefs <- c(names(fixef(step.lmer)), names(ranef(step.lmer)))
+  }
+  
+  lmer_coefs <- c(lmer_coefs, incl_coefs)
+  
+  # cat(paste0("\tLMER - ", paste0(incl_coefs[-1], collapse=", "), "\n"))
+  
+  tre <- ctree(update.formula(shannon_allvars,
+                observed_features ~ . - Sample_ID
+                - Child_age_months
+                - shannon_entropy - faith_pd - observed_features), data=filtered_df)
+  plot(tre)
+  
+  
+  window <- window + window_step
+}
+
+lmer_tab <- tabulate(factor(lmer_coefs))
+#lmer_tab <- paste0(round(100 * lmer_tab[2:length(lmer_tab)] / lmer_tab[1], 2), "%")
+lmer_tab <- lmer_tab[2:length(lmer_tab)]
+names(lmer_tab) <- levels(factor(lmer_coefs))[2:(length(lmer_tab)+1)]
+lmer_tab[order(tabulate(factor(lmer_coefs))[2:(length(lmer_tab)+1)], decreasing=T)]
+
+print("----------------------------------------------")
+
+lasso_tab <- tabulate(factor(lasso_coefs))
+lasso_tab <- paste0(round(100 * lasso_tab[2:length(lasso_tab)] / lasso_tab[1], 2), "%")
+names(lasso_tab) <- levels(factor(lasso_coefs))[2:(length(lasso_tab)+1)]
+lasso_tab[order(tabulate(factor(lasso_coefs))[2:(length(lasso_tab)+1)], decreasing=T)]
+```
+
+
+
+## Testing nested models for age
+
+Decision trees above show us that splitting on age is useful! Fit an `lmer` (or `glmer`) model w/ just age + resident commune, then one with age * age_category + resident commune, then do a nested ANOVA to see whether grouping like that leads to significant improvement.
+
+```{r}
+tre <- partykit::ctree(shannon_entropy ~ . - Sample_ID - observed_features - Resident_Commune_ID - Village_ID - Resident_Region_ID - faith_pd, 
+                       data=meta_df)
+ggparty(tre)
+
+tre.lmer.fit <- lmer(update.formula(shannon_allvars,
+                shannon_entropy ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID
+                + I(meta_df[-outlier_idxs,]$Child_age_months > 30) * Child_age_months + I(Child_age_months^2)
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID) + (1 | Village_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=log_df)
+step.tre.lmer.fit <- step(tre.lmer.fit, direction="both", trace=F)
+tre.shanA <- attr(step.tre.lmer.fit, "model")
+ranova(tre.shanA, test="F")
+
+tre.shanB <- lmer(shannon_entropy ~ Child_age_months * I(meta_df[-outlier_idxs, ]$Child_age_months > 30) 
+                  + Feces_visible_in_outdoor_food_preparation_area 
+                  + (1 | Resident_Commune_ID), 
+                  data=log_df)
+anova(tre.shanA, tre.shanB)
+
+tre.shanC <- lmer(shannon_entropy ~ Child_age_months + I(meta_df[-outlier_idxs, ]$Child_age_months > 30) 
+                  + (1 | Resident_Commune_ID),
+                  data=log_df)
+anova(tre.shanA, tre.shanC)
+
+tre.shanD <- lmer(shannon_entropy ~ Child_age_months + I(Child_age_months^2) + I(meta_df[-outlier_idxs, ]$Child_age_months > 30) 
+                  + (1 | Resident_Commune_ID),
+                  data=log_df)
+anova(tre.shanC, tre.shanD)
+
+AIC(tre.shanD)  # not as good as shannonE
+AIC(shannonE)
+```
+
+Now for faith
+
+```{r}
+tre <- partykit::ctree(faith_pd ~ . - Sample_ID - shannon_entropy - faith_pd - observed_features, data=meta_df)
+plot(tre)
+
+tre.lmer.fit <- lmer(update.formula(shannon_allvars,
+                faith_pd ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID
+                + I(meta_df[-outlier_idxs,]$Child_age_months > 38) * Child_age_months + I(Child_age_months^2)
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=log_df)
+step.tre.lmer.fit <- step(tre.lmer.fit, direction="both", trace=F)
+
+tre.faithA <- lm(faith_pd ~ Number_of_cattle_owned + I(Child_age_months > -0.274), 
+                data=log_df)
+anova(tre.faithA, test="F")
+
+tre.faithB <- lm(faith_pd ~ I(Child_age_months > -0.274), 
+                data=log_df)
+anova(tre.faithA, tre.faithB)
+
+tre.faithC <- lm(faith_pd ~ Child_age_months + I(Child_age_months > -0.274)
+                 + Number_of_cattle_owned, 
+                data=log_df)
+anova(tre.faithC)
+
+tre.faithD <- lm(faith_pd ~ Child_age_months
+                 + Number_of_cattle_owned, 
+                 data=log_df)
+anova(tre.faithD)
+
+tre.faithE <- lm(faith_pd ~ Child_age_months + I(Child_age_months^2)
+                 + Number_of_cattle_owned, 
+                data=log_df)
+anova(tre.faithE)
+
+tre.faithF <- lm(faith_pd ~ Child_age_months, 
+                data=log_df)
+anova(tre.faithF)
+
+tre.faithG <- lmer(faith_pd ~ Child_age_months
+                   + (1 | Resident_Region_ID), 
+                   data=log_df)
+anova(tre.faithG, tre.faithF)
+
+
+c(AIC(tre.faithF), AIC(tre.faithE), AIC(tre.faithD)) < AIC(faithD)
+c(AIC(tre.faithF), AIC(tre.faithE), AIC(tre.faithD))
+
+# not actually a tree model though!
+# but, age + cattle + age^2 has best AIC
+```
+
+Now for obs_feats
+
+```{r}
+tre <- partykit::ctree(observed_features ~ . - Sample_ID - shannon_entropy - faith_pd - observed_features, data=meta_df)
+plot(tre)
+
+tre.lmer.fit <- lmer(update.formula(shannon_allvars,
+                observed_features ~ . - Sample_ID - Resident_Region_ID - Resident_Commune_ID - Village_ID
+                + I(Child_age_months > -1.078) * Child_age_months
+                + I(Child_age_months^2)
+                - shannon_entropy - faith_pd - observed_features
+                + (1 | Resident_Region_ID) + (1 | Resident_Commune_ID) + (1 | Village_ID)
+                - Number_of_animals_owned - Number_of_animals_other_than_poultry_owned), data=log_df)
+step.tre.lmer.fit <- step(tre.lmer.fit, direction="both", trace=F)
+
+tre.obsA <- lmer(observed_features ~ Child_age_months + I(Child_age_months > -1.078)
+                 + (1 | Village_ID),
+                 data=log_df)
+drop1(tre.obsA, test="F")
+
+tre.obsB <- lmer(observed_features ~ Child_age_months + I(Child_age_months > -1.078) + I(Child_age_months^2)
+                 + (1 | Village_ID),
+                 data=log_df)
+anova(tre.obsA, tre.obsB)
+
+tre.obsC <- lmer(observed_features ~ Child_age_months * I(Child_age_months > -1.078)
+                 + (1 | Village_ID),
+                 data=log_df)
+anova(tre.obsA, tre.obsC)
+
+tre.obsD <- lmer(observed_features ~ Child_age_months + I(Child_age_months > -1.078)
+                 + (Child_age_months | Village_ID),
+                 data=log_df)
+anova(tre.obsA, tre.obsD)
+
+tre.obsE <- lmer(observed_features ~ Child_age_months + I(Child_age_months > -1.078)
+                 + Number_of_cattle_owned
+                 + (1 | Village_ID),
+                 data=log_df)
+anova(tre.obsA, tre.obsE)
+
+drop1(tre.obsA, test="F")
+ranova(tre.obsA)
+
+AIC(tre.obsA)
+AIC(obsB)
+
+# tre.obsA has very slightly better AIC, but we still consider
+# obsB better, because tre.obsA looked @ every possible split
+# for age in the decision tree.
+```
+
+### Best models
+
+faithC; obsB; shannonE
+
+* shannon_entropy ~ age + age^2 + (1 | Resident_commune_ID)
+* faith_pd ~ age
+* observed_features ~ age + age^2 + (1 | village_ID)
+
+### Plot predictions
+
+```{r}
+commune_df <- log_full %>%
+  mutate(shannon_pred=sqrt(predict(shannonE, newdata=log_full, type="response", allow.new.levels=T)),
+         faith_pred=predict(faithC, newdata=log_full, type="response", allow.new.levels=T)^2,
+         obs_pred=predict(obsB, newdata=log_full, type="response", allow.new.levels=T)^(3/2)) %>%
+  mutate(Child_age_months=meta_df$Child_age_months) %>%
+  filter(Resident_Commune_ID %in% c(8, 9, 10, 11, 12, 13, 14, 15, 16)) %>%
+  mutate(Resident_Commune_ID=paste0("Commune ID ", Resident_Commune_ID))
+
+ggplot(commune_df, aes(x=Child_age_months, y=sqrt(shannon_entropy))) +
+  geom_point() + geom_line(aes(y=shannon_pred), color="red") +
+  geom_point(aes(y=shannon_pred), color="red") +
+  facet_wrap(~Resident_Commune_ID) +
+  labs(x="Child age (months)", y="Shannon Entropy")
+
+ggplot(commune_df, aes(x=Child_age_months, y=faith_pd^2)) +
+  geom_point() + geom_line(aes(y=faith_pred), color="red") +
+  geom_point(aes(y=faith_pred), color="red") +
+  facet_wrap(~Resident_Commune_ID) +
+  labs(x="Child age (months)", y="Faith's PD")
+
+ggplot(commune_df, aes(x=Child_age_months, y=observed_features^(3/2))) +
+  geom_point() + geom_line(aes(y=obs_pred), color="red") +
+  geom_point(aes(y=obs_pred), color="red") +
+  facet_wrap(~Resident_Commune_ID) +
+  labs(x="Child age (months)", y="Observed Features")
+
+
+village_df <- log_full %>%
+  mutate(shannon_pred=sqrt(predict(shannonE, newdata=log_full, type="response", allow.new.levels=T)),
+         faith_pred=predict(faithC, newdata=log_full, type="response", allow.new.levels=T)^2,
+         obs_pred=predict(obsB, newdata=log_full, type="response", allow.new.levels=T)^(3/2)) %>%
+  mutate(Child_age_months=meta_df$Child_age_months) %>%
+  filter(Village_ID %in% sort(c(1115, 1099, 1088, 110, 234, 1130, 1201, 1192, 1008))) %>%
+  mutate(Village_ID=paste0("Village ID ", Village_ID))
+
+ggplot(village_df, aes(x=Child_age_months, y=sqrt(shannon_entropy))) +
+  geom_point() + geom_line(aes(y=shannon_pred), color="red") +
+  geom_point(aes(y=shannon_pred), color="red") +
+  facet_wrap(~Village_ID) +
+  labs(x="Child age (months)", y="Shannon Entropy")
+
+ggplot(village_df, aes(x=Child_age_months, y=faith_pd^2)) +
+  geom_point() + geom_line(aes(y=faith_pred), color="red") +
+  geom_point(aes(y=faith_pred), color="red") +
+  facet_wrap(~Village_ID) +
+  labs(x="Child age (months)", y="Faith's PD")
+
+ggplot(village_df, aes(x=Child_age_months, y=observed_features^(3/2))) +
+  geom_point() + geom_line(aes(y=obs_pred), color="red") +
+  geom_point(aes(y=obs_pred), color="red") +
+  facet_wrap(~Village_ID) +
+  labs(x="Child age (months)", y="Observed Features")
+
+
+region_df <- log_full %>%
+  mutate(shannon_pred=sqrt(predict(shannonE, newdata=log_full, type="response", allow.new.levels=T)),
+         faith_pred=predict(faithC, newdata=log_full, type="response", allow.new.levels=T)^2,
+         obs_pred=predict(obsB, newdata=log_full, type="response", allow.new.levels=T)^(3/2)) %>%
+  mutate(Child_age_months=meta_df$Child_age_months) %>%
+  mutate(Resident_Region_ID=paste0("Region ID ", Resident_Region_ID))
+
+ggplot(region_df, aes(x=Child_age_months, y=sqrt(shannon_entropy))) +
+  geom_point() +
+  geom_point(aes(y=shannon_pred), color="red", alpha=0.5) +
+  facet_wrap(~Resident_Region_ID) +
+  labs(x="Child age (months)", y="Shannon Entropy")
+
+ggplot(region_df, aes(x=Child_age_months, y=faith_pd^2)) +
+  geom_point() +
+  geom_point(aes(y=faith_pred), color="red") +
+  facet_wrap(~Resident_Region_ID) +
+  labs(x="Child age (months)", y="Faith's PD")
+
+ggplot(region_df, aes(x=Child_age_months, y=observed_features^(3/2))) +
+  geom_point() +
+  geom_point(aes(y=obs_pred), color="red") +
+  facet_wrap(~Resident_Region_ID) +
+  labs(x="Child age (months)", y="Observed Features")
+```
+
+```{r}
+gg_df <- meta_df[c(-152, -330),] %>%
+  mutate(shannon_pred=fitted(fit.shannon)*sd(shannon_entropy)+mean(shannon_entropy),
+         faith_pred=round(fitted(fit.faith)*sd(faith_pd)+mean(faith_pd), 2),
+         obs_pred=fitted(fit.obs)*sd(observed_features)+mean(observed_features))
+
+ggplot(gg_df, aes(x=shannon_pred, y=shannon_entropy)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0) +
+  lims(x=c(4, 7), y=c(2.5, 8.5))
+
+ggplot(gg_df, aes(x=factor(faith_pred), y=faith_pd)) +
+  geom_boxplot(outlier.alpha=0) +
+  geom_point(position=position_jitter(width=0.05), alpha=0.05) +
+  geom_abline(slope=3.11, intercept=25.24)
+
+ggplot(gg_df, aes(x=obs_pred, y=observed_features)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
